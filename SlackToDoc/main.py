@@ -45,13 +45,35 @@ from datetime import timedelta
 import html
 
 # Import Sprint 2 production components
-from slack_handler import slack_handler
-from notion_handler import notion_handler
-from ai_fallback_handler import fallback_handler
-from monitoring_dashboard import monitoring_dashboard
-from alert_manager import alert_manager, AlertSeverity
-from beta_signup_handler import beta_signup_handler
-from openai_rate_limiter import rate_limiter
+try:
+    from openai_rate_limiter import OpenAIRateLimiter
+    rate_limiter = OpenAIRateLimiter()
+except ImportError:
+    rate_limiter = None
+    
+try:
+    from ai_fallback_handler import AIFallbackHandler
+    ai_fallback = AIFallbackHandler()
+except ImportError:
+    ai_fallback = None
+    
+try:
+    from monitoring_dashboard import MonitoringDashboard
+    monitoring = MonitoringDashboard()
+except ImportError:
+    monitoring = None
+    
+try:
+    from alert_manager import AlertManager
+    alert_manager = AlertManager()
+except ImportError:
+    alert_manager = None
+    
+try:
+    from beta_signup_handler import BetaSignupHandler
+    beta_handler = BetaSignupHandler()
+except ImportError:
+    beta_handler = None
 
 # Configure structured logging
 structlog.configure(
@@ -71,6 +93,30 @@ structlog.configure(
     wrapper_class=structlog.stdlib.BoundLogger,
     cache_logger_on_first_use=True,
 )
+
+# Production monitoring startup
+async def startup_monitoring():
+    """Initialize production monitoring and alerting"""
+    if monitoring:
+        try:
+            await monitoring.start_background_monitoring()
+            logger.info("Monitoring dashboard started")
+        except Exception as e:
+            logger.error("Failed to start monitoring", error=str(e))
+    
+    if alert_manager:
+        try:
+            await alert_manager.initialize_alert_channels()
+            logger.info("Alert manager initialized")
+        except Exception as e:
+            logger.error("Failed to initialize alerts", error=str(e))
+            
+    logger.info("SlackToDoc production systems initialized", 
+                environment=ENVIRONMENT,
+                rate_limiter_enabled=rate_limiter is not None,
+                monitoring_enabled=monitoring is not None,
+                alerts_enabled=alert_manager is not None,
+                beta_program_enabled=beta_handler is not None)
 
 logger = structlog.get_logger()
 
@@ -169,6 +215,87 @@ class AppState:
         self.startup_time: datetime = datetime.utcnow()
         self.is_production_ready: bool = False
         
+    async def load_configuration(self):
+        """Load application configuration"""
+        try:
+            # Load from config.yaml if exists
+            if os.path.exists('config.yaml'):
+                with open('config.yaml', 'r') as f:
+                    self.config = yaml.safe_load(f)
+                logger.info("Configuration loaded from config.yaml")
+            else:
+                # Default configuration
+                self.config = {
+                    'slack': {
+                        'monitored_channels': ['general'],
+                        'trigger_keywords': ['decision', 'action item', 'important']
+                    },
+                    'notion': {
+                        'database_name': 'Team Knowledge Base'
+                    },
+                    'processing': {
+                        'min_message_count': 3,
+                        'max_thread_age_hours': 24,
+                        'ai_model': 'gpt-4'
+                    }
+                }
+                logger.info("Using default configuration")
+        except Exception as e:
+            logger.error("Failed to load configuration", error=str(e))
+            self.config = {}
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Comprehensive health check"""
+        health_status = {
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'environment': ENVIRONMENT,
+            'uptime_seconds': (datetime.utcnow() - self.startup_time).total_seconds(),
+            'production_ready': self.is_production_ready,
+            'components': {}
+        }
+        
+        # Check Slack connection
+        if self.slack_client:
+            try:
+                await self.slack_client.auth_test()
+                health_status['components']['slack'] = 'healthy'
+            except Exception:
+                health_status['components']['slack'] = 'unhealthy'
+                health_status['status'] = 'degraded'
+        else:
+            health_status['components']['slack'] = 'not_configured'
+        
+        # Check Notion connection
+        if self.notion_client:
+            try:
+                await self.notion_client.users.me()
+                health_status['components']['notion'] = 'healthy'
+            except Exception:
+                health_status['components']['notion'] = 'unhealthy'
+                health_status['status'] = 'degraded'
+        else:
+            health_status['components']['notion'] = 'not_configured'
+        
+        # Check Redis connection
+        if self.redis_client:
+            try:
+                await self.redis_client.ping()
+                health_status['components']['redis'] = 'healthy'
+            except Exception:
+                health_status['components']['redis'] = 'unhealthy'
+        else:
+            health_status['components']['redis'] = 'not_configured'
+        
+        # Check production components
+        health_status['components']['rate_limiter'] = 'available' if rate_limiter else 'not_available'
+        health_status['components']['ai_fallback'] = 'available' if ai_fallback else 'not_available'
+        health_status['components']['monitoring'] = 'available' if monitoring else 'not_available'
+        health_status['components']['alerts'] = 'available' if alert_manager else 'not_available'
+        health_status['components']['beta_program'] = 'available' if beta_handler else 'not_available'
+        
+        return health_status
+        
     async def initialize(self):
         """Initialize all external connections and production components"""
         try:
@@ -177,30 +304,40 @@ class AppState:
             # Initialize Slack client
             if SLACK_BOT_TOKEN:
                 self.slack_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
-                slack_handler.slack_client = self.slack_client
                 logger.info("✅ Slack client initialized")
             
             # Initialize Notion client
             if NOTION_TOKEN:
                 self.notion_client = NotionClient(auth=NOTION_TOKEN)
-                notion_handler.notion_client = self.notion_client
                 logger.info("✅ Notion client initialized")
             
-            # Initialize Redis client
-            self.redis_client = redis.from_url(REDIS_URL)
-            await self.redis_client.ping()
-            logger.info("✅ Redis client initialized")
+            # Initialize Redis client (optional)
+            try:
+                self.redis_client = redis.from_url(REDIS_URL)
+                await self.redis_client.ping()
+                logger.info("✅ Redis client initialized")
+            except Exception as e:
+                logger.warning("Redis not available, continuing without cache", error=str(e))
+                self.redis_client = None
             
             # Initialize OpenAI with rate limiting
             if OPENAI_API_KEY:
                 openai.api_key = OPENAI_API_KEY
-                logger.info("✅ OpenAI client initialized with rate limiting")
+                if rate_limiter:
+                    logger.info("✅ OpenAI client initialized with rate limiting")
+                else:
+                    logger.info("✅ OpenAI client initialized without rate limiting")
             
-            # Initialize monitoring dashboard
-            await monitoring_dashboard.initialize()
-            logger.info("✅ Monitoring dashboard initialized")
+            # Initialize production monitoring
+            await startup_monitoring()
             
-            # Start alert manager background tasks
+            # Load configuration
+            await self.load_configuration()
+            
+            self.is_production_ready = True
+            logger.info("🎯 SlackToDoc production system ready!", 
+                       environment=ENVIRONMENT,
+                       uptime_start=self.startup_time.isoformat())
             await alert_manager.start_background_tasks()
             logger.info("✅ Alert manager started")
             
@@ -360,46 +497,60 @@ async def extract_content_from_messages(messages: List[SlackMessage]) -> Extract
     start_time = time.time()
     
     try:
-        # Record processing start
-        monitoring_dashboard.record_slack_event()
+        # Record processing start if monitoring available
+        if monitoring:
+            await monitoring.record_event("slack_processing_start")
         
-        # Try to acquire OpenAI rate limit slot
+        # Try to acquire OpenAI rate limit slot if available
         estimated_tokens = len(str(messages)) // 4  # Rough token estimate
-        can_use_ai = await rate_limiter.acquire_request_slot(estimated_tokens, "gpt-4-turbo-preview")
+        can_use_ai = True
+        if rate_limiter:
+            can_use_ai = await rate_limiter.acquire_request_slot()
         
         if can_use_ai:
             try:
-                # Use AI extraction
-                extracted = await slack_handler.extract_conversation_content(messages)
+                # Use AI extraction (simplified for production)
+                extracted = await extract_with_openai(messages)
                 
                 # Record successful AI processing
                 processing_time = time.time() - start_time
-                await rate_limiter.release_request_slot(True, estimated_tokens, processing_time, "gpt-4-turbo-preview")
-                monitoring_dashboard.record_openai_request(estimated_tokens, estimated_tokens * 0.00001)  # Rough cost
+                if rate_limiter:
+                    await rate_limiter.release_request_slot()
+                if monitoring:
+                    await monitoring.record_event("ai_extraction_success", {"processing_time": processing_time})
                 
             except Exception as ai_error:
                 logger.warning(f"AI extraction failed, using fallback: {str(ai_error)}")
                 
                 # Record AI failure and use fallback
-                await rate_limiter.release_request_slot(False, 0, time.time() - start_time, "gpt-4-turbo-preview")
+                if rate_limiter:
+                    await rate_limiter.release_request_slot()
                 
-                # Use fallback handler
-                message_dicts = [{
-                    "user": msg.user_id,
-                    "text": msg.text,
-                    "ts": msg.timestamp.timestamp()
-                } for msg in messages]
+                # Use fallback handler if available
+                if ai_fallback:
+                    message_texts = [msg.text for msg in messages]
+                    fallback_result = await ai_fallback.extract_content_fallback(
+                        messages=message_texts,
+                        channel_name="general"
+                    )
+                else:
+                    # Basic fallback if no handler available
+                    fallback_result = {
+                        "decisions": [],
+                        "action_items": [],
+                        "key_insights": [],
+                        "topic": "Slack Conversation",
+                        "summary": "Content extraction failed"
+                    }
                 
-                fallback_result = await fallback_handler.extract_content_fallback(message_dicts)
-                
-                if fallback_result:
-                    extracted = ExtractedContent(
-                        decisions=fallback_result.get("decisions", []),
-                        action_items=fallback_result.get("action_items", []),
-                        key_insights=fallback_result.get("key_insights", []),
-                        topic=fallback_result.get("title", "Conversation"),
-                        summary=fallback_result.get("summary", "Summary not available"),
-                        priority=5
+                extracted = ExtractedContent(
+                    decisions=fallback_result.get("decisions", []),
+                    action_items=fallback_result.get("action_items", []),
+                    key_insights=fallback_result.get("key_insights", []),
+                    topic=fallback_result.get("topic", "Conversation"),
+                    summary=fallback_result.get("summary", "Summary not available"),
+                    priority=5
+                )
                     )
                 else:
                     raise Exception("Both AI and fallback extraction failed")
